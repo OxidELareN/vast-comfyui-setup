@@ -289,10 +289,19 @@ install_from_stage_or_existing \
     "$MODELS/loras/RealisticSnapshot-Zimage-Turbov5.safetensors" \
     150000000
 
-install_from_stage_or_existing \
+if ! install_from_stage_or_existing \
     "sam_vit_b_01ec64.pth" \
     "$MODELS/sams/sam_vit_b_01ec64.pth" \
     300000000
+then
+    echo "SAM checkpoint not found in author repository; downloading official checkpoint."
+    wget -O "$MODELS/sams/sam_vit_b_01ec64.pth" \
+        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+
+    require_file_min_size \
+        "$MODELS/sams/sam_vit_b_01ec64.pth" \
+        300000000
+fi
 
 install_from_stage_or_existing \
     "face_yolov8m.pt" \
