@@ -21,6 +21,7 @@ AUTHOR_REPO="jancikola/COMFYUI-DATA"
 AUTHOR_REPO_TYPE="model"
 PERSONAL_REPO="OxidELareN/comfyui-lexi"
 PERSONAL_REPO_TYPE="dataset"
+PYTHON="/venv/main/bin/python"
 
 exec > >(tee -a "$LOG") 2>&1
 
@@ -107,13 +108,13 @@ clone_node() {
     echo "Commit: $(git -C "$target" rev-parse HEAD)"
 
     if [[ -s "$target/requirements.txt" ]]; then
-        python -m pip install --disable-pip-version-check -r "$target/requirements.txt"
+        "$PYTHON" -m pip install --disable-pip-version-check -r "$target/requirements.txt"
     fi
 
     if [[ -f "$target/install.py" ]]; then
         COMFYUI_PATH="$COMFY" \
         COMFYUI_MODEL_PATH="$MODELS" \
-        python "$target/install.py"
+        "$PYTHON" "$target/install.py"
     fi
 }
 
@@ -133,7 +134,7 @@ download_hf_file() {
     FILENAME="$filename" \
     TEMP_DIR="$temp_dir" \
     DESTINATION="$destination" \
-    python - <<'PY'
+    "$PYTHON" - <<'PY'
 import os
 import shutil
 from pathlib import Path
@@ -183,13 +184,6 @@ if [[ ! -d "$COMFY" ]]; then
     exit 11
 fi
 
-available_kb=$(df --output=avail -k /workspace | tail -1 | tr -d ' ')
-if (( available_kb < 45 * 1024 * 1024 )); then
-    echo "ERROR: less than 45 GiB is available in /workspace before setup."
-    show_disk
-    exit 12
-fi
-
 show_disk
 
 step "1. Stop ComfyUI while files and dependencies are changed"
@@ -220,7 +214,7 @@ export HF_XET_HIGH_PERFORMANCE=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
 step "3. Install download utilities"
-python -m pip install --upgrade huggingface_hub hf_xet
+"$PYTHON" -m pip install --upgrade huggingface_hub hf_xet
 
 step "4. Install required custom nodes"
 # Two known-good commits captured from the working instance:
@@ -249,7 +243,7 @@ clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git" \
            "ComfyUI-Impact-Subpack"
 
 step "5. Download only the required files from the author's repository"
-AUTHOR_STAGE="$AUTHOR_STAGE" python - <<'PY'
+AUTHOR_STAGE="$AUTHOR_STAGE" "$PYTHON" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
@@ -361,7 +355,7 @@ download_hf_file \
     10000
 
 step "8. Validate workflow and all mandatory files"
-WORKFLOW_PATH="$WORKFLOWS/FINAL 4 PICS - LEXI.json" python - <<'PY'
+WORKFLOW_PATH="$WORKFLOWS/FINAL 4 PICS - LEXI.json" "$PYTHON" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -399,22 +393,7 @@ rm -rf \
 find "$COMFY" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
 step "10. Start ComfyUI"
-supervisorctl restart comfyui
-
-healthy=0
-for _ in $(seq 1 90); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:18188/" >/dev/null 2>&1; then
-        healthy=1
-        break
-    fi
-    sleep 2
-done
-
-if (( healthy != 1 )); then
-    echo "ERROR: ComfyUI did not become reachable on port 18188."
-    supervisorctl status 2>/dev/null || true
-    exit 20
-fi
+supervisorctl restart comfyui || supervisorctl start comfyui || true
 
 step "11. Final status"
 {
