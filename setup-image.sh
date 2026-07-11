@@ -242,6 +242,9 @@ clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git" \
 clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git" \
            "ComfyUI-Impact-Subpack"
 
+clone_node "https://github.com/ClownsharkBatwing/RES4LYF.git" \
+           "RES4LYF"
+
 step "5. Download only the required files from the author's repository"
 AUTHOR_STAGE="$AUTHOR_STAGE" "$PYTHON" - <<'PY'
 import os
