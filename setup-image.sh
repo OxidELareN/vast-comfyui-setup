@@ -3,32 +3,68 @@ set -Eeuo pipefail
 
 # ============================================================
 # Vast.ai -> ComfyUI image setup for FINAL 4 PICS - LEXI
-# No secrets are stored in this file. HF_TOKEN must be supplied
-# as a Vast.ai account-level environment variable.
+# Version: 2.0.0
+#
+# HF_TOKEN must be supplied as a Vast.ai account-level variable.
+# This script is safe to retry: heavy provisioning is skipped once
+# all files and custom nodes have already been prepared.
 # ============================================================
 
+SCRIPT_VERSION="2.0.0"
 COMFY="/workspace/ComfyUI"
 NODES="$COMFY/custom_nodes"
 MODELS="$COMFY/models"
 WORKFLOWS="$COMFY/user/default/workflows"
 LOG="/workspace/setup-image.log"
 READY="/workspace/SETUP_IMAGE_READY"
+FILES_READY="/workspace/SETUP_IMAGE_FILES_READY"
+LOCK="/workspace/.setup-image.lock"
 HF_HOME_DIR="/workspace/.hf-setup-cache"
 AUTHOR_STAGE="/workspace/.author-data-stage"
 PERSONAL_STAGE="/workspace/.personal-data-stage"
+CONSTRAINTS="/workspace/.comfy-pip-constraints.txt"
+COMFY_PORT="${OPEN_BUTTON_PORT:-18188}"
 
 AUTHOR_REPO="jancikola/COMFYUI-DATA"
-AUTHOR_REPO_TYPE="model"
 PERSONAL_REPO="OxidELareN/comfyui-lexi"
 PERSONAL_REPO_TYPE="dataset"
 
+# Use exactly the Python environment in which ComfyUI runs.
+if [[ -x /venv/main/bin/python ]]; then
+    PYTHON_BIN="/venv/main/bin/python"
+else
+    PYTHON_BIN="$(command -v python)"
+fi
+
+mkdir -p /workspace
+
+# Prevent concurrent duplicate provisioning runs.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "Another setup-image.sh process is already running; exiting safely."
+    exit 0
+fi
+
+# Append logs; never truncate a log that may be watched with tail -f.
 exec > >(tee -a "$LOG") 2>&1
+
+echo
+echo "============================================================"
+echo "SETUP RUN STARTED"
+echo "Version: $SCRIPT_VERSION"
+echo "Time: $(date --iso-8601=seconds)"
+echo "Python: $PYTHON_BIN"
+echo "ComfyUI port: $COMFY_PORT"
+echo "============================================================"
 
 on_error() {
     local exit_code=$?
+    trap - ERR
     echo
     echo "============================================================"
     echo "SETUP FAILED (exit code: $exit_code)"
+    echo "Files-ready marker: $FILES_READY"
+    echo "Final-ready marker: $READY"
     echo "Log: $LOG"
     echo "============================================================"
     df -h /workspace / 2>/dev/null || true
@@ -88,10 +124,54 @@ install_from_stage_or_existing() {
     require_file_min_size "$destination" "$min_bytes"
 }
 
+build_pip_constraints() {
+    "$PYTHON_BIN" - <<'PY' > "$CONSTRAINTS"
+from importlib.metadata import PackageNotFoundError, version
+
+# Never let a custom-node requirement replace the CUDA/PyTorch stack
+# supplied by the tested Vast.ai ComfyUI image.
+for package in ("torch", "torchvision", "torchaudio", "triton"):
+    try:
+        print(f"{package}=={version(package)}")
+    except PackageNotFoundError:
+        pass
+PY
+    echo "Protected package constraints:"
+    cat "$CONSTRAINTS"
+}
+
+install_requirements() {
+    local target="$1"
+    local mode="${2:-normal}"
+    local requirements="$target/requirements.txt"
+    local effective_requirements="$requirements"
+
+    [[ -s "$requirements" ]] || return 0
+
+    if [[ "$mode" == "without-sam2" ]]; then
+        effective_requirements=$(mktemp /tmp/requirements-no-sam2-XXXXXX.txt)
+        grep -Eiv 'facebookresearch/sam2|git\+.*sam2' "$requirements" > "$effective_requirements" || true
+        echo "Skipping optional SAM2 dependency; this workflow uses sam_vit_b_01ec64.pth, not SAM2."
+    fi
+
+    "$PYTHON_BIN" -m pip install \
+        --no-cache-dir \
+        --disable-pip-version-check \
+        --upgrade-strategy only-if-needed \
+        -c "$CONSTRAINTS" \
+        -r "$effective_requirements"
+
+    if [[ "$effective_requirements" != "$requirements" ]]; then
+        rm -f "$effective_requirements"
+    fi
+}
+
 clone_node() {
     local repo="$1"
     local folder="$2"
     local ref="${3:-}"
+    local requirements_mode="${4:-normal}"
+    local run_install_py="${5:-no}"
     local target="$NODES/$folder"
 
     echo
@@ -106,14 +186,15 @@ clone_node() {
     echo "Source: $(git -C "$target" remote get-url origin)"
     echo "Commit: $(git -C "$target" rev-parse HEAD)"
 
-    if [[ -s "$target/requirements.txt" ]]; then
-        python -m pip install --disable-pip-version-check -r "$target/requirements.txt"
-    fi
+    install_requirements "$target" "$requirements_mode"
 
-    if [[ -f "$target/install.py" ]]; then
+    if [[ "$run_install_py" == "yes" && -f "$target/install.py" ]]; then
+        # Impact Pack documents this marker to suppress automatic model downloads.
+        touch "$NODES/skip_download_model"
         COMFYUI_PATH="$COMFY" \
         COMFYUI_MODEL_PATH="$MODELS" \
-        python "$target/install.py"
+        "$PYTHON_BIN" "$target/install.py"
+        rm -f "$NODES/skip_download_model"
     fi
 }
 
@@ -125,6 +206,11 @@ download_hf_file() {
     local min_bytes="$5"
     local temp_dir
 
+    if [[ -f "$destination" ]] && [[ $(stat -c '%s' "$destination") -ge $min_bytes ]]; then
+        echo "Already present: $destination"
+        return 0
+    fi
+
     temp_dir=$(mktemp -d /workspace/.hf-one-file-XXXXXX)
     mkdir -p "$(dirname "$destination")"
 
@@ -133,26 +219,21 @@ download_hf_file() {
     FILENAME="$filename" \
     TEMP_DIR="$temp_dir" \
     DESTINATION="$destination" \
-    python - <<'PY'
+    "$PYTHON_BIN" - <<'PY'
 import os
 import shutil
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 
-repo_id = os.environ["REPO_ID"]
-repo_type = os.environ["REPO_TYPE"]
-filename = os.environ["FILENAME"]
-temp_dir = Path(os.environ["TEMP_DIR"])
-destination = Path(os.environ["DESTINATION"])
-
 path = Path(hf_hub_download(
-    repo_id=repo_id,
-    repo_type=repo_type,
-    filename=filename,
+    repo_id=os.environ["REPO_ID"],
+    repo_type=os.environ["REPO_TYPE"],
+    filename=os.environ["FILENAME"],
     token=os.environ["HF_TOKEN"],
-    local_dir=temp_dir,
+    local_dir=Path(os.environ["TEMP_DIR"]),
 ))
 
+destination = Path(os.environ["DESTINATION"])
 destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.move(str(path), str(destination))
 print(f"Installed: {destination}")
@@ -163,9 +244,86 @@ PY
     rm -rf "$HF_HOME_DIR/hub" "$HF_HOME_DIR/xet" 2>/dev/null || true
 }
 
+start_and_wait_for_comfyui() {
+    step "Start ComfyUI and wait for its API"
+
+    if curl -fsS --max-time 5 "http://127.0.0.1:${COMFY_PORT}/object_info" >/dev/null 2>&1; then
+        echo "ComfyUI API is already reachable on port ${COMFY_PORT}."
+        return 0
+    fi
+
+    supervisorctl restart comfyui 2>/dev/null || supervisorctl start comfyui
+
+    local healthy=0
+    # Allow up to 12 minutes for the first startup after custom-node installation.
+    for _ in $(seq 1 360); do
+        if curl -fsS --max-time 5 "http://127.0.0.1:${COMFY_PORT}/object_info" >/dev/null 2>&1; then
+            healthy=1
+            break
+        fi
+        sleep 2
+    done
+
+    if (( healthy != 1 )); then
+        echo "ERROR: ComfyUI did not become reachable on port ${COMFY_PORT}."
+        supervisorctl status 2>/dev/null || true
+        echo "--- comfyui stderr ---"
+        supervisorctl tail comfyui stderr 2>/dev/null || true
+        echo "--- comfyui stdout ---"
+        supervisorctl tail comfyui stdout 2>/dev/null || true
+        return 20
+    fi
+
+    echo "ComfyUI API is reachable on port ${COMFY_PORT}."
+}
+
+validate_loaded_nodes() {
+    step "Validate required workflow nodes through ComfyUI API"
+
+    COMFY_PORT="$COMFY_PORT" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import urllib.request
+
+url = f"http://127.0.0.1:{os.environ['COMFY_PORT']}/object_info"
+with urllib.request.urlopen(url, timeout=30) as response:
+    objects = json.load(response)
+
+required = {
+    "Float",
+    "SimpleMath+",
+    "UltralyticsDetectorProvider",
+    "SAMLoader",
+    "FaceDetailer",
+    "FaceDetailerPipe",
+    "ImpactSwitch",
+    "ToDetailerPipeSDXL",
+    "Power Lora Loader (rgthree)",
+    "Text Prompt (JPS)",
+}
+missing = sorted(required.difference(objects))
+if missing:
+    raise SystemExit("ERROR: required nodes failed to load: " + ", ".join(missing))
+
+print(f"Required workflow nodes loaded successfully ({len(required)} checked).")
+PY
+}
+
+validate_mandatory_files() {
+    require_file_min_size "$MODELS/checkpoints/intorealismUltra_v90.safetensors" 6000000000
+    require_file_min_size "$MODELS/checkpoints/pornmasterZImage_turboV35Bf16.safetensors" 12000000000
+    require_file_min_size "$MODELS/diffusion_models/z_image_turbo_bf16.safetensors" 12000000000
+    require_file_min_size "$MODELS/text_encoders/qwen_3_4b.safetensors" 8000000000
+    require_file_min_size "$MODELS/vae/ae.safetensors" 300000000
+    require_file_min_size "$MODELS/loras/RealisticSnapshot-Zimage-Turbov5.safetensors" 150000000
+    require_file_min_size "$MODELS/loras/leximodellora.safetensors" 170000000
+    require_file_min_size "$MODELS/sams/sam_vit_b_01ec64.pth" 300000000
+    require_file_min_size "$MODELS/ultralytics/bbox/face_yolov8m.pt" 40000000
+    require_file_min_size "$MODELS/ultralytics/bbox/vagina-v4.2.pt" 40000000
+    require_file_min_size "$WORKFLOWS/FINAL 4 PICS - LEXI.json" 10000
+}
+
 step "0. Initial checks"
-rm -f "$READY"
-: > "$LOG"
 
 if [[ -z "${HF_TOKEN:-}" ]]; then
     echo "ERROR: HF_TOKEN is not available in the container."
@@ -183,9 +341,37 @@ if [[ ! -d "$COMFY" ]]; then
     exit 11
 fi
 
+"$PYTHON_BIN" --version
+"$PYTHON_BIN" -m pip --version
+
+# A fully completed setup is a fast no-op apart from ensuring the service is alive.
+if [[ -f "$READY" ]]; then
+    echo "Setup is already complete: $READY"
+    start_and_wait_for_comfyui
+    validate_loaded_nodes
+    exit 0
+fi
+
+# A retry after a health-check timeout must not reinstall 40+ GiB of data.
+if [[ -f "$FILES_READY" ]]; then
+    echo "All files were already provisioned in an earlier run; skipping heavy setup."
+    validate_mandatory_files
+    start_and_wait_for_comfyui
+    validate_loaded_nodes
+    {
+        echo "version=$SCRIPT_VERSION"
+        echo "completed_at=$(date --iso-8601=seconds)"
+        echo "workflow=$WORKFLOWS/FINAL 4 PICS - LEXI.json"
+        echo "lora=$MODELS/loras/leximodellora.safetensors"
+    } > "$READY"
+    show_disk
+    echo "IMAGE SETUP COMPLETED SUCCESSFULLY (retry path)"
+    exit 0
+fi
+
 available_kb=$(df --output=avail -k /workspace | tail -1 | tr -d ' ')
 if (( available_kb < 45 * 1024 * 1024 )); then
-    echo "ERROR: less than 45 GiB is available in /workspace before setup."
+    echo "ERROR: less than 45 GiB is available in /workspace before a fresh setup."
     show_disk
     exit 12
 fi
@@ -194,7 +380,7 @@ show_disk
 
 step "1. Stop ComfyUI while files and dependencies are changed"
 supervisorctl stop comfyui 2>/dev/null || true
-pkill -f '/venv/main/bin/python main.py' 2>/dev/null || true
+pkill -f '/venv/main/bin/python.*main.py' 2>/dev/null || true
 sleep 2
 
 step "2. Create required directories"
@@ -218,12 +404,18 @@ export HF_HUB_CACHE="$HF_HOME_DIR/hub"
 export HF_XET_CACHE="$HF_HOME_DIR/xet"
 export HF_XET_HIGH_PERFORMANCE=1
 export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_NO_CACHE_DIR=1
 
-step "3. Install download utilities"
-python -m pip install --upgrade huggingface_hub hf_xet
+step "3. Prepare the ComfyUI Python environment"
+"$PYTHON_BIN" -m pip install \
+    --no-cache-dir \
+    --disable-pip-version-check \
+    --upgrade-strategy only-if-needed \
+    huggingface_hub hf_xet
 
-step "4. Install required custom nodes"
-# Two known-good commits captured from the working instance:
+build_pip_constraints
+
+step "4. Install required custom nodes in the ComfyUI Python environment"
 clone_node "https://github.com/M1kep/ComfyLiterals.git" \
            "ComfyLiterals" \
            "bdddb08ca82d90d75d97b1d437a652e0284a32ac"
@@ -232,24 +424,34 @@ clone_node "https://github.com/JPS-GER/ComfyUI_JPS-Nodes.git" \
            "ComfyUI_JPS-Nodes" \
            "0e2a9aca02b17dde91577bfe4b65861df622dcaf"
 
-# These are installed from their maintained upstream repositories.
 clone_node "https://github.com/cubiq/ComfyUI_essentials.git" \
-           "ComfyUI_essentials"
+           "ComfyUI_essentials" \
+           "9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
 
 clone_node "https://github.com/rgthree/rgthree-comfy.git" \
-           "rgthree-comfy"
+           "rgthree-comfy" \
+           "27b4f4cdcf3b127c29d5d8135ac1536ecbd4c383"
 
 clone_node "https://github.com/chrisgoringe/cg-use-everywhere.git" \
-           "cg-use-everywhere"
+           "cg-use-everywhere" \
+           "632ed7bb51bb18ceb03ccaefe1f34be8bd416500"
 
 clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git" \
-           "ComfyUI-Impact-Pack"
+           "ComfyUI-Impact-Pack" \
+           "429d0159ad429e64d2b3916e6e7be9c22d025c3c" \
+           "without-sam2" \
+           "yes"
 
 clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git" \
-           "ComfyUI-Impact-Subpack"
+           "ComfyUI-Impact-Subpack" \
+           "74db20c95eca152a6d686c914edc0ef4e4762cb8" \
+           "normal" \
+           "yes"
+
+show_disk
 
 step "5. Download only the required files from the author's repository"
-AUTHOR_STAGE="$AUTHOR_STAGE" python - <<'PY'
+AUTHOR_STAGE="$AUTHOR_STAGE" "$PYTHON_BIN" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
@@ -315,7 +517,6 @@ download_hf_file \
     "split_files/diffusion_models/z_image_turbo_bf16.safetensors" \
     "$MODELS/diffusion_models/z_image_turbo_bf16.safetensors" \
     12000000000
-
 show_disk
 
 download_hf_file \
@@ -324,7 +525,6 @@ download_hf_file \
     "split_files/vae/ae.safetensors" \
     "$MODELS/vae/ae.safetensors" \
     300000000
-
 show_disk
 
 download_hf_file \
@@ -333,7 +533,6 @@ download_hf_file \
     "split_files/text_encoders/qwen_3_4b.safetensors" \
     "$MODELS/text_encoders/qwen_3_4b.safetensors" \
     8000000000
-
 show_disk
 
 step "7. Download Lexi LoRA and Lexi workflow"
@@ -352,7 +551,7 @@ download_hf_file \
     10000
 
 step "8. Validate workflow and all mandatory files"
-WORKFLOW_PATH="$WORKFLOWS/FINAL 4 PICS - LEXI.json" python - <<'PY'
+WORKFLOW_PATH="$WORKFLOWS/FINAL 4 PICS - LEXI.json" "$PYTHON_BIN" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -368,17 +567,13 @@ assert isinstance(data.get("nodes"), list) and data["nodes"], "Workflow has no n
 print(f"Workflow OK: {path} ({len(data['nodes'])} nodes)")
 PY
 
-require_file_min_size "$MODELS/checkpoints/intorealismUltra_v90.safetensors" 6000000000
-require_file_min_size "$MODELS/checkpoints/pornmasterZImage_turboV35Bf16.safetensors" 12000000000
-require_file_min_size "$MODELS/diffusion_models/z_image_turbo_bf16.safetensors" 12000000000
-require_file_min_size "$MODELS/text_encoders/qwen_3_4b.safetensors" 8000000000
-require_file_min_size "$MODELS/vae/ae.safetensors" 300000000
-require_file_min_size "$MODELS/loras/RealisticSnapshot-Zimage-Turbov5.safetensors" 150000000
-require_file_min_size "$MODELS/loras/leximodellora.safetensors" 170000000
-require_file_min_size "$MODELS/sams/sam_vit_b_01ec64.pth" 300000000
-require_file_min_size "$MODELS/ultralytics/bbox/face_yolov8m.pt" 40000000
-require_file_min_size "$MODELS/ultralytics/bbox/vagina-v4.2.pt" 40000000
-require_file_min_size "$WORKFLOWS/FINAL 4 PICS - LEXI.json" 10000
+validate_mandatory_files
+
+# This marker permits a safe lightweight retry if only the first UI startup times out.
+{
+    echo "version=$SCRIPT_VERSION"
+    echo "prepared_at=$(date --iso-8601=seconds)"
+} > "$FILES_READY"
 
 step "9. Clean temporary caches"
 rm -rf \
@@ -389,26 +584,12 @@ rm -rf \
 
 find "$COMFY" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
-step "10. Start ComfyUI"
-supervisorctl restart comfyui
-
-healthy=0
-for _ in $(seq 1 90); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:18188/" >/dev/null 2>&1; then
-        healthy=1
-        break
-    fi
-    sleep 2
-done
-
-if (( healthy != 1 )); then
-    echo "ERROR: ComfyUI did not become reachable on port 18188."
-    supervisorctl status 2>/dev/null || true
-    exit 20
-fi
+start_and_wait_for_comfyui
+validate_loaded_nodes
 
 step "11. Final status"
 {
+    echo "version=$SCRIPT_VERSION"
     echo "completed_at=$(date --iso-8601=seconds)"
     echo "workflow=$WORKFLOWS/FINAL 4 PICS - LEXI.json"
     echo "lora=$MODELS/loras/leximodellora.safetensors"
