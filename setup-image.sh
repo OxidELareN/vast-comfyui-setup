@@ -245,6 +245,9 @@ clone_node "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git" \
 clone_node "https://github.com/ClownsharkBatwing/RES4LYF.git" \
            "RES4LYF"
 
+clone_node "https://github.com/1038lab/ComfyUI-QwenVL.git" \
+           "ComfyUI-QwenVL"
+
 step "5. Download only the required files from the author's repository"
 AUTHOR_STAGE="$AUTHOR_STAGE" "$PYTHON" - <<'PY'
 import os
@@ -353,8 +356,22 @@ download_hf_file \
 download_hf_file \
     "$PERSONAL_REPO" \
     "$PERSONAL_REPO_TYPE" \
+    "loras/milliecarterLORA.safetensors" \
+    "$MODELS/loras/milliecarterLORA.safetensors" \
+    170000000
+
+download_hf_file \
+    "$PERSONAL_REPO" \
+    "$PERSONAL_REPO_TYPE" \
     "workflows/FINAL 4 PICS - LEXI.json" \
     "$WORKFLOWS/FINAL 4 PICS - LEXI.json" \
+    10000
+
+download_hf_file \
+    "$PERSONAL_REPO" \
+    "$PERSONAL_REPO_TYPE" \
+    "workflows/FINAL 4 PICS - LEXI - AUTOPROMPT.json" \
+    "$WORKFLOWS/FINAL 4 PICS - LEXI - AUTOPROMPT.json" \
     10000
 
 step "8. Validate workflow and all mandatory files"
